@@ -44,7 +44,7 @@ from embedding_utils import (
 
 CHUNK_SIZE = 500       # 每个文本块的最大字符数
 CHUNK_OVERLAP = 50     # 块间重叠字符数
-NOTION_API_VERSION = "2022-06-28"
+NOTION_API_VERSION = "2025-09-03"
 NOTION_BASE_URL = "https://api.notion.com/v1"
 
 # Embedding 模型配置映射
@@ -87,10 +87,10 @@ def notion_headers(token: str) -> dict:
     }
 
 
-def fetch_notion_database(token: str, db_id: str) -> list:
-    """获取数据库中的所有页面"""
+def fetch_notion_data_source(token: str, data_source_id: str) -> list:
+    """获取数据源中的所有页面"""
     headers = notion_headers(token)
-    url = f"{NOTION_BASE_URL}/databases/{db_id}/query"
+    url = f"{NOTION_BASE_URL}/data_sources/{data_source_id}/query"
     pages = []
     payload = {"page_size": 100}
     has_more = True
@@ -98,10 +98,10 @@ def fetch_notion_database(token: str, db_id: str) -> list:
     while has_more:
         resp = _make_request_with_retry("post", url, headers, json_data=payload)
         if not resp:
-            raise RuntimeError(f"Notion 数据库 {db_id} 拉取失败: 网络请求无响应")
+            raise RuntimeError(f"Notion 数据源 {data_source_id} 拉取失败: 网络请求无响应")
         if resp.status_code != 200:
             raise RuntimeError(
-                f"Notion API 错误 [{resp.status_code}] (db={db_id}): {resp.text[:200]}"
+                f"Notion API 错误 [{resp.status_code}] (data_source={data_source_id}): {resp.text[:200]}"
             )
         data = resp.json()
         pages.extend(data.get("results", []))
@@ -110,6 +110,62 @@ def fetch_notion_database(token: str, db_id: str) -> list:
             payload["start_cursor"] = data["next_cursor"]
 
     return pages
+
+
+def resolve_data_sources(token: str, config: dict, data_dir: str) -> list:
+    """
+    解析可同步的数据源。
+    优先使用配置中的 notion_data_source_ids；若只有 notion_db_ids，则自动发现并缓存 data_source_id。
+    """
+    headers = notion_headers(token)
+    configured_ds_ids = config.get("notion_data_source_ids", [])
+    db_ids = config.get("notion_db_ids", [])
+
+    sources = []
+    seen_ids = set()
+
+    def _add_source(ds_id: str, db_id: str = "", ds_name: str = ""):
+        if not ds_id or ds_id in seen_ids:
+            return
+        seen_ids.add(ds_id)
+        sources.append({
+            "data_source_id": ds_id,
+            "database_id": db_id,
+            "name": ds_name,
+        })
+
+    # 1) 先保留显式配置的数据源 ID
+    for ds_id in configured_ds_ids:
+        _add_source(ds_id)
+
+    # 2) 再从数据库发现数据源（兼容旧配置）
+    discovered_ds_ids = []
+    for db_id in db_ids:
+        url = f"{NOTION_BASE_URL}/databases/{db_id}"
+        resp = _make_request_with_retry("get", url, headers)
+        if not resp:
+            print(f"  ⚠️ 发现 data source 失败（网络无响应）: db={db_id}")
+            continue
+        if resp.status_code != 200:
+            print(f"  ⚠️ 发现 data source 失败: db={db_id} [{resp.status_code}]")
+            continue
+
+        data = resp.json()
+        for ds in data.get("data_sources", []):
+            ds_id = ds.get("id", "")
+            ds_name = ds.get("name", "")
+            if ds_id:
+                discovered_ds_ids.append(ds_id)
+                _add_source(ds_id, db_id=db_id, ds_name=ds_name)
+
+    # 3) 持久化发现结果，方便后续直接使用 data_source_id
+    merged_ds_ids = list(dict.fromkeys(configured_ds_ids + discovered_ds_ids))
+    if merged_ds_ids and merged_ds_ids != configured_ds_ids:
+        config["notion_data_source_ids"] = merged_ds_ids
+        save_config(data_dir, config)
+        print(f"[migration] 已缓存 {len(merged_ds_ids)} 个 data_source_id 到配置")
+
+    return sources
 
 
 def fetch_page_content(token: str, page_id: str) -> str:
@@ -359,8 +415,11 @@ def cmd_init_config(args):
             print("❌ 未找到现有配置。请先运行完整 init-config，再使用 --append-db")
             sys.exit(1)
 
-        required = ["notion_token", "notion_db_ids", "embedding_provider", "embedding_api_key"]
+        required = ["notion_token", "embedding_provider", "embedding_api_key"]
         missing = [r for r in required if r not in config or not config[r]]
+        has_any_source = bool(config.get("notion_db_ids") or config.get("notion_data_source_ids"))
+        if not has_any_source:
+            missing.append("notion_db_ids/notion_data_source_ids")
         if missing:
             print(f"❌ 现有配置不完整，无法追加数据库，缺少: {missing}")
             sys.exit(1)
@@ -375,8 +434,18 @@ def cmd_init_config(args):
                 print(f"   当前数据库列表: {db_ids}")
             else:
                 print(f"ℹ️ 数据库 {args.notion_db_id} 已存在")
+        elif args.notion_data_source_id:
+            ds_ids = config.get("notion_data_source_ids", [])
+            if args.notion_data_source_id not in ds_ids:
+                ds_ids.append(args.notion_data_source_id)
+                config["notion_data_source_ids"] = ds_ids
+                save_config(data_dir, config)
+                print(f"✅ 已添加 Notion 数据源: {args.notion_data_source_id}")
+                print(f"   当前数据源列表: {ds_ids}")
+            else:
+                print(f"ℹ️ 数据源 {args.notion_data_source_id} 已存在")
         else:
-            print("❌ --append-db 需要同时提供 --notion-db-id")
+            print("❌ --append-db 需要提供 --notion-db-id 或 --notion-data-source-id")
         return
 
     # 正常初始化 / 更新
@@ -387,6 +456,11 @@ def cmd_init_config(args):
         if args.notion_db_id not in existing_ids:
             existing_ids.append(args.notion_db_id)
         config["notion_db_ids"] = existing_ids
+    if args.notion_data_source_id:
+        existing_ids = config.get("notion_data_source_ids", [])
+        if args.notion_data_source_id not in existing_ids:
+            existing_ids.append(args.notion_data_source_id)
+        config["notion_data_source_ids"] = existing_ids
     if args.embedding_provider:
         provider = args.embedding_provider.lower()
         if provider not in EMBEDDING_CONFIGS:
@@ -403,8 +477,11 @@ def cmd_init_config(args):
         config["azure_deployment"] = args.azure_deployment
 
     # 验证必要字段
-    required = ["notion_token", "notion_db_ids", "embedding_provider", "embedding_api_key"]
+    required = ["notion_token", "embedding_provider", "embedding_api_key"]
     missing = [r for r in required if r not in config or not config[r]]
+    has_any_source = bool(config.get("notion_db_ids") or config.get("notion_data_source_ids"))
+    if not has_any_source:
+        missing.append("notion_db_ids/notion_data_source_ids")
     if missing:
         print(f"❌ 缺少必要配置项: {missing}")
         sys.exit(1)
@@ -421,7 +498,7 @@ def cmd_init_config(args):
     # 验证连通性
     print("\n🔗 验证 Notion API...")
     token = decode_key(config["notion_token"])
-    for db_id in config["notion_db_ids"]:
+    for db_id in config.get("notion_db_ids", []):
         try:
             resp = requests.get(
                 f"{NOTION_BASE_URL}/databases/{db_id}",
@@ -429,13 +506,29 @@ def cmd_init_config(args):
                 timeout=10
             )
             if resp.status_code == 200:
-                title = resp.json().get("title", [{}])
+                db_obj = resp.json()
+                title = db_obj.get("title", [{}])
                 db_name = title[0].get("plain_text", "无标题") if title else "无标题"
-                print(f"  ✅ 数据库连接成功: {db_name}")
+                ds_count = len(db_obj.get("data_sources", []))
+                print(f"  ✅ 数据库连接成功: {db_name} (data_sources={ds_count})")
             else:
                 print(f"  ❌ 数据库 {db_id} 连接失败 [{resp.status_code}]")
         except Exception as e:
             print(f"  ❌ 数据库 {db_id} 连接异常: {e}")
+
+    for ds_id in config.get("notion_data_source_ids", []):
+        try:
+            resp = requests.get(
+                f"{NOTION_BASE_URL}/data_sources/{ds_id}",
+                headers=notion_headers(token),
+                timeout=10
+            )
+            if resp.status_code == 200:
+                print(f"  ✅ 数据源连接成功: {ds_id}")
+            else:
+                print(f"  ❌ 数据源 {ds_id} 连接失败 [{resp.status_code}]")
+        except Exception as e:
+            print(f"  ❌ 数据源 {ds_id} 连接异常: {e}")
 
     print("\n🔗 验证 Embedding API...")
     test_embedding(config)
@@ -486,11 +579,11 @@ def cmd_sync(args):
     data_dir = args.data_dir
     config = load_config(data_dir)
     token = decode_key(config["notion_token"])
-    db_ids = config.get("notion_db_ids", [])
+    sources = resolve_data_sources(token, config, data_dir)
     full_sync = getattr(args, 'full', False)
 
-    if not db_ids:
-        print("Error: no Notion database IDs configured")
+    if not sources:
+        print("Error: no Notion data sources configured or discoverable")
         sys.exit(1)
 
     brain_dir = Path(data_dir) / "my_brain_db"
@@ -512,7 +605,7 @@ def cmd_sync(args):
         sys.exit(1)
 
     try:
-        _do_sync(data_dir, config, token, db_ids, full_sync, brain_dir)
+        _do_sync(data_dir, config, token, sources, full_sync, brain_dir)
     except Exception as e:
         print(f"❌ 同步失败，已终止写入: {e}")
         sys.exit(1)
@@ -524,7 +617,7 @@ def cmd_sync(args):
             pass
 
 
-def _do_sync(data_dir, config, token, db_ids, full_sync, brain_dir):
+def _do_sync(data_dir, config, token, sources, full_sync, brain_dir):
     """实际的同步逻辑（在文件锁保护下运行）"""
     vectors_path = brain_dir / "vectors.npy"
     meta_path = brain_dir / "chunks_meta.json"
@@ -561,11 +654,15 @@ def _do_sync(data_dir, config, token, db_ids, full_sync, brain_dir):
     stats = {"unchanged": 0, "modified": 0, "new": 0, "deleted": 0}
     seen_page_ids = set()
 
-    print(f"syncing {len(db_ids)} database(s)...\n")
+    print(f"syncing {len(sources)} data source(s)...\n")
 
-    for db_id in db_ids:
-        print(f"  database: {db_id}")
-        pages = fetch_notion_database(token, db_id)
+    for source in sources:
+        ds_id = source["data_source_id"]
+        db_id = source.get("database_id", "")
+        source_label = source.get("name") or ds_id
+
+        print(f"  data_source: {source_label} ({ds_id})")
+        pages = fetch_notion_data_source(token, ds_id)
         print(f"    {len(pages)} pages found")
 
         for page in pages:
@@ -622,6 +719,7 @@ def _do_sync(data_dir, config, token, db_ids, full_sync, brain_dir):
                 new_chunks_to_embed.append(chunk)
                 new_meta_to_embed.append({
                     "source_db": db_id,
+                    "source_data_source": ds_id,
                     "source_page": page_title,
                     "page_id": page_id,
                     "chunk_index": i,
@@ -757,6 +855,7 @@ def main():
   python notion_sync.py init-config \\
     --notion-token "ntn_xxx" \\
     --notion-db-id "abc123" \\
+        --notion-data-source-id "def456" \\
     --embedding-provider azure \\
     --embedding-api-key "your-key" \\
     --azure-endpoint "https://xxx.openai.azure.com" \\
@@ -766,6 +865,7 @@ def main():
   python notion_sync.py init-config \\
     --notion-token "ntn_xxx" \\
     --notion-db-id "abc123" \\
+        --notion-data-source-id "def456" \\
     --embedding-provider openai \\
     --embedding-api-key "sk-xxx" \\
     --data-dir "./data"
@@ -774,6 +874,7 @@ def main():
   python notion_sync.py init-config \\
     --notion-token "ntn_xxx" \\
     --notion-db-id "abc123" \\
+        --notion-data-source-id "def456" \\
     --embedding-provider gemini \\
     --embedding-api-key "AIzaXxx" \\
     --data-dir "./data"
@@ -792,6 +893,7 @@ def main():
     p_init = subparsers.add_parser("init-config", help="初始化/更新配置")
     p_init.add_argument("--notion-token", help="Notion Integration Token")
     p_init.add_argument("--notion-db-id", help="Notion 数据库 ID")
+    p_init.add_argument("--notion-data-source-id", help="Notion 数据源 ID")
     p_init.add_argument("--embedding-provider",
                         choices=["azure", "openai", "gemini"],
                         help="Embedding API 提供商")
