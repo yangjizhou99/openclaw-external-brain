@@ -138,6 +138,39 @@ def resolve_data_sources(token: str, config: dict, data_dir: str) -> list:
     for ds_id in configured_ds_ids:
         _add_source(ds_id)
 
+    # 1.5) 通过 Search API 自动发现 integration 当前可见的数据源
+    # 这可以覆盖“用户已经在 Notion 连接了数据库，但尚未写入本地配置”的场景。
+    search_url = f"{NOTION_BASE_URL}/search"
+    search_payload = {
+        "page_size": 100,
+        "filter": {
+            "property": "object",
+            "value": "data_source",
+        },
+    }
+    has_more = True
+    while has_more:
+        resp = _make_request_with_retry("post", search_url, headers, json_data=search_payload)
+        if not resp:
+            print("  ⚠️ Search data sources 失败（网络无响应）")
+            break
+        if resp.status_code != 200:
+            print(f"  ⚠️ Search data sources 失败 [{resp.status_code}]")
+            break
+
+        data = resp.json()
+        for item in data.get("results", []):
+            ds_id = item.get("id", "")
+            ds_name = item.get("title", "")
+            if ds_id:
+                _add_source(ds_id, ds_name=ds_name)
+
+        has_more = data.get("has_more", False)
+        if has_more and data.get("next_cursor"):
+            search_payload["start_cursor"] = data["next_cursor"]
+        else:
+            break
+
     # 2) 再从数据库发现数据源（兼容旧配置）
     discovered_ds_ids = []
     for db_id in db_ids:
@@ -160,12 +193,52 @@ def resolve_data_sources(token: str, config: dict, data_dir: str) -> list:
 
     # 3) 持久化发现结果，方便后续直接使用 data_source_id
     merged_ds_ids = list(dict.fromkeys(configured_ds_ids + discovered_ds_ids))
+    # 若 Search API 发现了数据源，也一起持久化
+    merged_ds_ids = list(dict.fromkeys(merged_ds_ids + [s["data_source_id"] for s in sources]))
     if merged_ds_ids and merged_ds_ids != configured_ds_ids:
         config["notion_data_source_ids"] = merged_ds_ids
         save_config(data_dir, config)
         print(f"[migration] 已缓存 {len(merged_ds_ids)} 个 data_source_id 到配置")
 
+    if not sources:
+        print("  ⚠️ 当前 integration 可见的数据源为 0。请确认数据库本体已连接到该 integration。")
+
     return sources
+
+
+def fetch_accessible_pages(token: str) -> list:
+    """通过 Search API 获取 integration 当前可访问的页面列表（非数据库模式）"""
+    headers = notion_headers(token)
+    url = f"{NOTION_BASE_URL}/search"
+    payload = {
+        "page_size": 100,
+        "filter": {
+            "property": "object",
+            "value": "page",
+        },
+    }
+
+    pages = []
+    has_more = True
+    while has_more:
+        resp = _make_request_with_retry("post", url, headers, json_data=payload)
+        if not resp:
+            raise RuntimeError("Notion 页面搜索失败: 网络请求无响应")
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Notion 页面搜索失败 [{resp.status_code}]: {resp.text[:200]}"
+            )
+
+        data = resp.json()
+        pages.extend(data.get("results", []))
+
+        has_more = data.get("has_more", False)
+        if has_more and data.get("next_cursor"):
+            payload["start_cursor"] = data["next_cursor"]
+        else:
+            break
+
+    return pages
 
 
 def fetch_page_content(token: str, page_id: str) -> str:
@@ -582,9 +655,15 @@ def cmd_sync(args):
     sources = resolve_data_sources(token, config, data_dir)
     full_sync = getattr(args, 'full', False)
 
+    page_mode = False
+    fallback_pages = []
     if not sources:
-        print("Error: no Notion data sources configured or discoverable")
-        sys.exit(1)
+        print("[fallback] no data sources found, switching to page sync mode")
+        fallback_pages = fetch_accessible_pages(token)
+        if not fallback_pages:
+            print("Error: no Notion data sources or pages accessible")
+            sys.exit(1)
+        page_mode = True
 
     brain_dir = Path(data_dir) / "my_brain_db"
     brain_dir.mkdir(parents=True, exist_ok=True)
@@ -605,7 +684,10 @@ def cmd_sync(args):
         sys.exit(1)
 
     try:
-        _do_sync(data_dir, config, token, sources, full_sync, brain_dir)
+        if page_mode:
+            _do_sync_pages(data_dir, config, token, fallback_pages, full_sync, brain_dir)
+        else:
+            _do_sync(data_dir, config, token, sources, full_sync, brain_dir)
     except Exception as e:
         print(f"❌ 同步失败，已终止写入: {e}")
         sys.exit(1)
@@ -809,6 +891,173 @@ def _do_sync(data_dir, config, token, sources, full_sync, brain_dir):
 
     size_mb = status["storage_bytes"] / (1024 * 1024)
     print(f"\nsync complete!")
+    print(f"   pages: {total_pages}")
+    print(f"   chunks: {len(final_meta)}")
+    print(f"   dimensions: {status['vector_dimensions']}")
+    print(f"   storage: {size_mb:.1f} MB")
+    print(f"   stats: new={stats['new']}, modified={stats['modified']}, "
+          f"unchanged={stats['unchanged']}, deleted={stats['deleted']}")
+
+
+def _do_sync_pages(data_dir, config, token, pages, full_sync, brain_dir):
+    """页面模式同步：直接同步 integration 可访问的页面（无数据库）"""
+    vectors_path = brain_dir / "vectors.npy"
+    meta_path = brain_dir / "chunks_meta.json"
+
+    old_vectors, old_meta = None, None
+    page_edit_index = {}
+
+    if not full_sync:
+        old_vectors, old_meta = load_existing_sync_data(brain_dir)
+        if old_meta is not None:
+            page_edit_index = build_page_edit_index(old_meta)
+            print(f"[incremental] loaded {len(page_edit_index)} cached pages")
+        else:
+            print("[incremental] no cache found, running full sync")
+
+    if full_sync:
+        print("[full sync] forcing full re-sync of all pages")
+
+    if vectors_path.exists():
+        backup_path = brain_dir / "vectors_backup.npy"
+        import shutil
+        shutil.copy2(str(vectors_path), str(backup_path))
+        print("backed up previous vectors")
+
+    final_meta = []
+    final_vectors_parts = []
+    new_chunks_to_embed = []
+    new_meta_to_embed = []
+    stats = {"unchanged": 0, "modified": 0, "new": 0, "deleted": 0}
+    seen_page_ids = set()
+
+    print(f"syncing {len(pages)} accessible page(s)...\n")
+
+    for page in pages:
+        page_id = page["id"]
+        page_title = get_page_title(page)
+        page_edited = page.get("last_edited_time", "")
+        seen_page_ids.add(page_id)
+
+        cached_edit_time = page_edit_index.get(page_id)
+        if (not full_sync
+                and cached_edit_time
+                and cached_edit_time == page_edited
+                and old_meta is not None
+                and old_vectors is not None):
+            page_meta, page_vecs = get_chunks_for_page(page_id, old_meta, old_vectors)
+            if page_meta and page_vecs is not None:
+                final_meta.extend(page_meta)
+                final_vectors_parts.append(page_vecs)
+                stats["unchanged"] += 1
+                print(f"    [skip] {page_title} (unchanged)")
+                continue
+
+        if cached_edit_time:
+            stats["modified"] += 1
+            label = "update"
+        else:
+            stats["new"] += 1
+            label = "new"
+        print(f"    [{label}] {page_title}")
+
+        props_text = extract_page_properties(page)
+        body_text = fetch_page_content(token, page_id)
+
+        if props_text and body_text.strip():
+            content = f"{props_text}\n---\n{body_text}"
+        elif props_text:
+            content = props_text
+        elif body_text.strip():
+            content = body_text
+        else:
+            print(f"      [skip] empty content")
+            continue
+
+        chunks = split_text(content)
+        for i, chunk in enumerate(chunks):
+            new_chunks_to_embed.append(chunk)
+            new_meta_to_embed.append({
+                "source_db": "",
+                "source_data_source": "",
+                "source_page": page_title,
+                "page_id": page_id,
+                "chunk_index": i,
+                "char_count": len(chunk),
+                "last_edited_time": page_edited,
+            })
+
+        print(f"      {len(chunks)} chunks")
+
+    if old_meta is not None:
+        old_page_ids = set(m.get("page_id", "") for m in old_meta)
+        deleted_ids = old_page_ids - seen_page_ids
+        stats["deleted"] = len(deleted_ids)
+
+    if new_chunks_to_embed:
+        print(f"\nembedding {len(new_chunks_to_embed)} new chunks...")
+        new_vectors = get_embeddings(new_chunks_to_embed, config)
+        print(f"done, shape: {new_vectors.shape}")
+
+        for meta_item, chunk_text in zip(new_meta_to_embed, new_chunks_to_embed):
+            meta_item["text"] = chunk_text
+
+        final_meta.extend(new_meta_to_embed)
+        final_vectors_parts.append(new_vectors)
+    else:
+        print("\nno new content to embed")
+
+    if not final_meta:
+        print("\nwarning: no content found in accessible pages")
+        return
+
+    if final_vectors_parts:
+        all_vectors = np.concatenate(final_vectors_parts, axis=0)
+    else:
+        print("\nwarning: no vectors to save")
+        return
+
+    if not full_sync and old_vectors is not None:
+        del old_vectors
+        import gc
+        gc.collect()
+
+    tmp_vectors = brain_dir / "vectors_tmp.npy"
+    tmp_meta = brain_dir / "chunks_meta_tmp.json"
+    np.save(str(tmp_vectors), all_vectors)
+    with open(tmp_meta, "w", encoding="utf-8") as f:
+        json.dump(final_meta, f, ensure_ascii=False, indent=2)
+    os.replace(str(tmp_vectors), str(vectors_path))
+    os.replace(str(tmp_meta), str(meta_path))
+
+    total_pages = len(set(m.get("page_id", "") for m in final_meta))
+    status = {
+        "last_sync": datetime.now(timezone.utc).isoformat(),
+        "total_pages": total_pages,
+        "total_chunks": len(final_meta),
+        "vector_dimensions": int(all_vectors.shape[1]),
+        "embedding_provider": config["embedding_provider"],
+        "embedding_model": config.get("embedding_model", "unknown"),
+        "storage_bytes": vectors_path.stat().st_size + meta_path.stat().st_size,
+        "last_sync_stats": stats,
+        "sync_mode": "pages",
+    }
+    status_path = brain_dir / "sync_status.json"
+    with open(status_path, "w", encoding="utf-8") as f:
+        json.dump(status, f, ensure_ascii=False, indent=2)
+
+    backup_path = brain_dir / "vectors_backup.npy"
+    try:
+        _test_vectors = np.load(str(vectors_path), mmap_mode="r")
+        assert _test_vectors.shape[0] == len(final_meta), "向量行数与元数据不匹配"
+        del _test_vectors
+        if backup_path.exists():
+            backup_path.unlink()
+    except Exception as e:
+        print(f"  ⚠️ 写入验证失败，保留备份文件: {e}")
+
+    size_mb = status["storage_bytes"] / (1024 * 1024)
+    print(f"\nsync complete! [mode=pages]")
     print(f"   pages: {total_pages}")
     print(f"   chunks: {len(final_meta)}")
     print(f"   dimensions: {status['vector_dimensions']}")
