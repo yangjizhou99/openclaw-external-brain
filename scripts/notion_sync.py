@@ -8,7 +8,6 @@ notion_sync.py — Notion 知识库夜间同步脚本
 """
 
 import argparse
-import base64
 import json
 import os
 import sys
@@ -33,6 +32,12 @@ try:
 except ImportError:
     print("❌ 缺少 requests，请安装: pip install requests")
     sys.exit(1)
+
+from embedding_utils import (
+    encode_key, decode_key, load_config as _load_config, save_config,
+    make_request_with_retry as _make_request_with_retry,
+    get_embeddings, test_embedding,
+)
 
 
 # ─────────────────────────── 常量 ───────────────────────────
@@ -63,32 +68,13 @@ EMBEDDING_CONFIGS = {
 
 # ─────────────────────────── 工具函数 ───────────────────────────
 
-def encode_key(key: str) -> str:
-    """Base64 编码 API Key（非明文存储）"""
-    return base64.b64encode(key.encode()).decode()
-
-
-def decode_key(encoded: str) -> str:
-    """解码 Base64 API Key"""
-    return base64.b64decode(encoded.encode()).decode()
-
-
 def load_config(data_dir: str) -> dict:
-    """加载配置文件"""
-    config_path = Path(data_dir) / "config.json"
-    if not config_path.exists():
+    """加载配置文件（带错误退出）"""
+    config = _load_config(data_dir)
+    if config is None:
         print("❌ 配置文件不存在，请先运行 init-config")
         sys.exit(1)
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_config(data_dir: str, config: dict):
-    """保存配置文件"""
-    config_path = Path(data_dir) / "config.json"
-    Path(data_dir).mkdir(parents=True, exist_ok=True)
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    return config
 
 
 # ─────────────────────────── Notion API ───────────────────────────
@@ -99,23 +85,6 @@ def notion_headers(token: str) -> dict:
         "Notion-Version": NOTION_API_VERSION,
         "Content-Type": "application/json",
     }
-
-
-def _make_request_with_retry(method: str, url: str, headers: dict, json_data: dict = None, max_retries: int = 3):
-    for attempt in range(max_retries):
-        try:
-            if method.lower() == "get":
-                return requests.get(url, headers=headers, timeout=30)
-            else:
-                return requests.post(url, headers=headers, json=json_data, timeout=30)
-        except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1:
-                print(f"  ⚠️ 网络请求异常，{attempt+1}秒后重试... ({type(e).__name__})")
-                time.sleep(attempt + 1)
-            else:
-                print(f"  ❌ 网络请求最终失败: {e}")
-                return None
-    return None
 
 
 def fetch_notion_database(token: str, db_id: str) -> list:
@@ -129,10 +98,11 @@ def fetch_notion_database(token: str, db_id: str) -> list:
     while has_more:
         resp = _make_request_with_retry("post", url, headers, json_data=payload)
         if not resp:
-            break
+            raise RuntimeError(f"Notion 数据库 {db_id} 拉取失败: 网络请求无响应")
         if resp.status_code != 200:
-            print(f"❌ Notion API 错误 [{resp.status_code}]: {resp.text[:200]}")
-            sys.exit(1)
+            raise RuntimeError(
+                f"Notion API 错误 [{resp.status_code}] (db={db_id}): {resp.text[:200]}"
+            )
         data = resp.json()
         pages.extend(data.get("results", []))
         has_more = data.get("has_more", False)
@@ -143,32 +113,50 @@ def fetch_notion_database(token: str, db_id: str) -> list:
 
 
 def fetch_page_content(token: str, page_id: str) -> str:
-    """获取单个页面的全部文本内容（递归读取所有 block）"""
+    """获取单个页面的全部文本内容（递归读取嵌套 block）"""
     headers = notion_headers(token)
-    url = f"{NOTION_BASE_URL}/blocks/{page_id}/children?page_size=100"
     texts = []
-    
-    pages_fetched = 0
-    while url and pages_fetched < 20:
-        pages_fetched += 1
-        resp = _make_request_with_retry("get", url, headers)
-        if not resp:
-            break
-        if resp.status_code != 200:
-            print(f"  ⚠️ 读取页面 {page_id} 失败: {resp.status_code}")
-            break
-        data = resp.json()
-        for block in data.get("results", []):
-            text = extract_block_text(block)
-            if text:
-                texts.append(text)
-        if data.get("has_more") and data.get("next_cursor"):
-            url = f"{NOTION_BASE_URL}/blocks/{page_id}/children?page_size=100&start_cursor={data['next_cursor']}"
-        else:
-            url = None
 
-    if pages_fetched >= 20:
-        print(f"  ⚠️ 达到最大页数限制，停止拉取页面 {page_id}")
+    max_pages = 20
+    page_count = 0
+
+    def _walk_children(block_id: str, depth: int = 0):
+        nonlocal page_count
+        if depth > 30:
+            return
+
+        next_cursor = None
+        while page_count < max_pages:
+            page_count += 1
+            url = f"{NOTION_BASE_URL}/blocks/{block_id}/children?page_size=100"
+            if next_cursor:
+                url += f"&start_cursor={next_cursor}"
+
+            resp = _make_request_with_retry("get", url, headers)
+            if not resp:
+                raise RuntimeError(f"读取页面 {page_id} block 失败: 网络请求无响应")
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"读取页面 {page_id} block 失败 [{resp.status_code}]: {resp.text[:200]}"
+                )
+
+            data = resp.json()
+            for block in data.get("results", []):
+                text = extract_block_text(block)
+                if text:
+                    texts.append(text)
+                if block.get("has_children") and block.get("id"):
+                    _walk_children(block["id"], depth + 1)
+
+            if data.get("has_more") and data.get("next_cursor"):
+                next_cursor = data["next_cursor"]
+            else:
+                break
+
+    _walk_children(page_id)
+
+    if page_count >= max_pages:
+        print(f"  ⚠️ 达到最大 block 分页限制(2000 blocks)，停止拉取页面 {page_id}")
 
     return "\n".join(texts)
 
@@ -346,122 +334,8 @@ def split_text(text: str, chunk_size: int = CHUNK_SIZE,
     return chunks
 
 
-# ─────────────────────────── Embedding API ───────────────────────────
-
-def get_embeddings(texts: list, config: dict) -> np.ndarray:
-    """调用用户选择的 Embedding API 进行批量向量化"""
-    provider = config["embedding_provider"]
-    api_key = decode_key(config["embedding_api_key"])
-
-    if provider == "azure":
-        return _embed_azure(texts, api_key, config)
-    elif provider == "openai":
-        return _embed_openai(texts, api_key, config)
-    elif provider == "gemini":
-        return _embed_gemini(texts, api_key, config)
-    else:
-        print(f"❌ 不支持的 Embedding 提供商: {provider}")
-        sys.exit(1)
-
-
-def _embed_azure(texts: list, api_key: str, config: dict) -> np.ndarray:
-    """Azure OpenAI Embedding"""
-    endpoint = config.get("azure_endpoint", "").rstrip("/")
-    deployment = config.get("azure_deployment", "text-embedding-3-small")
-    url = f"{endpoint}/openai/deployments/{deployment}/embeddings?api-version=2024-02-01"
-
-    all_embeddings = []
-    # Azure 批量限制通常为 16 条
-    batch_size = 16
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        resp = _make_request_with_retry("post", url, headers={
-            "api-key": api_key,
-            "Content-Type": "application/json",
-        }, json_data={"input": batch}, max_retries=3)
-        if not resp:
-            sys.exit(1)
-        if resp.status_code != 200:
-            print(f"❌ Azure Embedding 错误 [{resp.status_code}]: {resp.text[:200]}")
-            sys.exit(1)
-        data = resp.json()
-        for item in sorted(data["data"], key=lambda x: x["index"]):
-            all_embeddings.append(item["embedding"])
-        # 节约内存：每批之间短暂暂停
-        if i + batch_size < len(texts):
-            time.sleep(0.2)
-
-    return np.array(all_embeddings, dtype=np.float32)
-
-
-def _embed_openai(texts: list, api_key: str, config: dict) -> np.ndarray:
-    """OpenAI Embedding"""
-    model = config.get("embedding_model", "text-embedding-3-small")
-    url = "https://api.openai.com/v1/embeddings"
-
-    all_embeddings = []
-    batch_size = 20
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        resp = _make_request_with_retry("post", url, headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }, json_data={"input": batch, "model": model}, max_retries=3)
-        if not resp:
-            sys.exit(1)
-        if resp.status_code != 200:
-            print(f"❌ OpenAI Embedding 错误 [{resp.status_code}]: {resp.text[:200]}")
-            sys.exit(1)
-        data = resp.json()
-        for item in sorted(data["data"], key=lambda x: x["index"]):
-            all_embeddings.append(item["embedding"])
-        if i + batch_size < len(texts):
-            time.sleep(0.2)
-
-    return np.array(all_embeddings, dtype=np.float32)
-
-
-def _embed_gemini(texts: list, api_key: str, config: dict) -> np.ndarray:
-    """Google Gemini Embedding"""
-    model = config.get("embedding_model", "gemini-embedding-001")
-    base_url = "https://generativelanguage.googleapis.com/v1beta"
-
-    all_embeddings = []
-    # Gemini batchEmbedContents 支持批量
-    batch_size = 100
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        url = f"{base_url}/models/{model}:batchEmbedContents?key={api_key}"
-        requests_body = [{"model": f"models/{model}",
-                          "content": {"parts": [{"text": t}]}}
-                         for t in batch]
-        resp = _make_request_with_retry("post", url, headers={
-            "Content-Type": "application/json",
-        }, json_data={"requests": requests_body}, max_retries=3)
-        if not resp:
-            sys.exit(1)
-        if resp.status_code != 200:
-            print(f"❌ Gemini Embedding 错误 [{resp.status_code}]: {resp.text[:200]}")
-            sys.exit(1)
-        data = resp.json()
-        for emb in data.get("embeddings", []):
-            all_embeddings.append(emb["values"])
-        if i + batch_size < len(texts):
-            time.sleep(0.2)
-
-    return np.array(all_embeddings, dtype=np.float32)
-
-
-def test_embedding(config: dict) -> bool:
-    """验证 Embedding API 连通性"""
-    try:
-        result = get_embeddings(["测试连接"], config)
-        dim = result.shape[1]
-        print(f"  ✅ Embedding API 连接成功，向量维度: {dim}")
-        return True
-    except Exception as e:
-        print(f"  ❌ Embedding API 连接失败: {e}")
-        return False
+# ─────────────────────── Embedding API（来自 embedding_utils.py）──────────────
+# get_embeddings / test_embedding 已从 embedding_utils 导入
 
 
 # ─────────────────────────── 命令: init-config ───────────────────────────
@@ -481,6 +355,16 @@ def cmd_init_config(args):
 
     # 追加数据库模式
     if args.append_db:
+        if not config_path.exists():
+            print("❌ 未找到现有配置。请先运行完整 init-config，再使用 --append-db")
+            sys.exit(1)
+
+        required = ["notion_token", "notion_db_ids", "embedding_provider", "embedding_api_key"]
+        missing = [r for r in required if r not in config or not config[r]]
+        if missing:
+            print(f"❌ 现有配置不完整，无法追加数据库，缺少: {missing}")
+            sys.exit(1)
+
         if args.notion_db_id:
             db_ids = config.get("notion_db_ids", [])
             if args.notion_db_id not in db_ids:
@@ -567,7 +451,7 @@ def load_existing_sync_data(brain_dir: Path):
     if not vectors_path.exists() or not meta_path.exists():
         return None, None
 
-    vectors = np.load(str(vectors_path))
+    vectors = np.load(str(vectors_path), mmap_mode="r")
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
@@ -612,6 +496,36 @@ def cmd_sync(args):
     brain_dir = Path(data_dir) / "my_brain_db"
     brain_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── 文件锁防止并发同步 ──
+    lock_path = brain_dir / "sync.lock"
+    lock_file = open(lock_path, "w")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        print("❌ 另一个同步进程正在运行，请稍后重试")
+        lock_file.close()
+        sys.exit(1)
+
+    try:
+        _do_sync(data_dir, config, token, db_ids, full_sync, brain_dir)
+    except Exception as e:
+        print(f"❌ 同步失败，已终止写入: {e}")
+        sys.exit(1)
+    finally:
+        lock_file.close()
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def _do_sync(data_dir, config, token, db_ids, full_sync, brain_dir):
+    """实际的同步逻辑（在文件锁保护下运行）"""
     vectors_path = brain_dir / "vectors.npy"
     meta_path = brain_dir / "chunks_meta.json"
 
@@ -638,7 +552,6 @@ def cmd_sync(args):
         print("backed up previous vectors")
 
     # ── 分类页面：new / modified / unchanged ──
-    final_chunks = []       # 最终的文本列表
     final_meta = []         # 最终的元数据列表
     final_vectors_parts = []  # 最终的向量列表（待合并）
 
@@ -752,10 +665,21 @@ def cmd_sync(args):
         print("\nwarning: no vectors to save")
         return
 
-    # ── 保存 ──
-    np.save(str(vectors_path), all_vectors)
-    with open(meta_path, "w", encoding="utf-8") as f:
+    # ── 释放内存映射文件的句柄，准备覆盖写入 ──
+    if not full_sync and old_vectors is not None:
+        del old_vectors
+        import gc
+        gc.collect()
+
+    # ── 保存（原子写入：先写临时文件，再替换）──
+    tmp_vectors = brain_dir / "vectors_tmp.npy"
+    tmp_meta = brain_dir / "chunks_meta_tmp.json"
+    np.save(str(tmp_vectors), all_vectors)
+    with open(tmp_meta, "w", encoding="utf-8") as f:
         json.dump(final_meta, f, ensure_ascii=False, indent=2)
+    # 替换正式文件（os.replace 在同一文件系统上是原子操作）
+    os.replace(str(tmp_vectors), str(vectors_path))
+    os.replace(str(tmp_meta), str(meta_path))
 
     # ── 记录同步状态 ──
     total_pages = len(set(m.get("page_id", "") for m in final_meta))
@@ -773,10 +697,17 @@ def cmd_sync(args):
     with open(status_path, "w", encoding="utf-8") as f:
         json.dump(status, f, ensure_ascii=False, indent=2)
 
-    # ── 清理备份 ──
+    # ── 清理备份（所有文件写入成功后再删除）──
     backup_path = brain_dir / "vectors_backup.npy"
-    if backup_path.exists():
-        backup_path.unlink()
+    try:
+        # 验证刚写入的文件完整性
+        _test_vectors = np.load(str(vectors_path), mmap_mode="r")
+        assert _test_vectors.shape[0] == len(final_meta), "向量行数与元数据不匹配"
+        del _test_vectors
+        if backup_path.exists():
+            backup_path.unlink()
+    except Exception as e:
+        print(f"  ⚠️ 写入验证失败，保留备份文件: {e}")
 
     size_mb = status["storage_bytes"] / (1024 * 1024)
     print(f"\nsync complete!")

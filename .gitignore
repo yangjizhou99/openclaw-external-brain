@@ -1,11 +1,12 @@
 # Data directory containing sensitive config and large vectors
 data/
-*.npy
-*.json
-!**/*.json
+# Explicit reminder: never commit local credentials
+data/config.json
 
-# Keep config structure but not the real contents, though no template config exists yet.
-# We'll just ignore the whole data directory since it's generated locally.
+# Sync lock file and temp files
+data/my_brain_db/sync.lock
+data/my_brain_db/vectors_tmp.npy
+data/my_brain_db/chunks_meta_tmp.json
 
 # Python cache
 __pycache__/

@@ -5,7 +5,7 @@ description: >
   直接部署在 OpenClaw 所在的云服务器上（2GB 运存），仅依赖 numpy + requests。
   V2: 自动提取数据库属性（Select/Date/Number等），增量同步（仅处理新增和修改的页面）。
   默认使用 Gemini Embedding API（免费额度大），也支持 Azure / OpenAI。
-  触发关键词：搜索笔记、查我的记录、Notion、外脑、知识库、检索。
+  触发关键词：搜索笔记、查我的记录、Notion、外脑、知识库、检索、search notes、my records、knowledge base。
 emoji: 🧠
 dependencies:
   - python>=3.8
@@ -74,7 +74,20 @@ python scripts/notion_sync.py init-config \
 该命令会：
 - 验证 Notion Token 连通性（尝试读取数据库元信息）
 - 验证 Embedding API Key 有效性（尝试生成一个测试向量）
-- 将所有配置加密存储到 `data/config.json`
+- 将所有配置 Base64 编码后存储到 `data/config.json`（注意：是编码而非加密，请确保服务器文件权限安全）
+
+### 1.2 多数据库支持
+
+系统支持同时连接多个 Notion 数据库。初始化后可追加：
+
+```bash
+python scripts/notion_sync.py init-config \
+  --append-db \
+  --notion-db-id "<新数据库ID>" \
+  --data-dir "<SKILL目录>/data"
+```
+
+追加后，下次同步会自动拉取所有已配置的数据库。
 
 ---
 
@@ -123,9 +136,9 @@ python scripts/notion_sync.py status \
   上次同步: 2026-03-05 03:00:12
   文档总数: 47 篇
   文本块数: 312 块
-  向量维度: 1536
+  向量维度: 3072
   存储大小: 2.1 MB
-  Embedding: azure (text-embedding-3-small)
+  Embedding: gemini (gemini-embedding-001)
 ```
 
 ### 2.3 配置定时自动同步（推荐）
@@ -183,7 +196,10 @@ python scripts/tool_search_brain.py search \
 - 将返回的文本段落作为上下文，结合用户原始问题进行总结回答
 - 如果 score < 0.5，提示用户"知识库中没有找到高度相关的记录"
 - 如果知识库为空，提示用户先执行同步
+- 如果检索返回 `error` 字段（如 Embedding API 超时、网络异常、维度不一致），向用户说明“检索服务暂时不可用，请稍后重试”
 
+> **知识库规模建议**：在 2GB 服务器上，建议知识库不超过 2000 篇文档（约 10000 文本块）。
+> 超出此规模后同步时内存可能不足，建议升级服务器或拆分数据库。
 ---
 
 ## 4. 日常工作流
@@ -222,6 +238,9 @@ python scripts/notion_sync.py init-config \
   --data-dir "<SKILL目录>/data" \
   --append-db
 ```
+
+> ⚠️ `--append-db` 需要已有完整配置（`notion_token`、`embedding_provider` 等），
+> 若未初始化会直接报错并退出。
 
 ---
 
@@ -263,7 +282,8 @@ python scripts/notion_sync.py init-config \
 ### 数据安全
 - `config.json` 中的 API Key 以 base64 编码存储（注意：base64 并非加密，仅作简单混淆）
 - 同步前自动备份上一次的向量文件
-- 所有脚本操作都有错误处理和日志输出
+- 检索脚本在网络异常或维度不一致时会返回结构化 `error` 字段，便于 OpenClaw 统一处理
+- 建议将 `data/config.json` 视为本机私密文件，不要提交到远程仓库
 
 ---
 

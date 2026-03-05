@@ -6,7 +6,6 @@ tool_search_brain.py — OpenClaw 外脑语义检索工具
 """
 
 import argparse
-import base64
 import json
 import sys
 import time
@@ -24,82 +23,24 @@ except ImportError:
     print("❌ 缺少 numpy，请安装: pip install numpy")
     sys.exit(1)
 
-try:
-    import requests
-except ImportError:
-    print("❌ 缺少 requests，请安装: pip install requests")
-    sys.exit(1)
+from embedding_utils import load_config as _load_config, embed_query
 
 
 # ─────────────────────────── 工具函数 ───────────────────────────
 
-def decode_key(encoded: str) -> str:
-    """解码 Base64 API Key"""
-    return base64.b64decode(encoded.encode()).decode()
-
-
 def load_config(data_dir: str) -> dict:
     """加载配置文件"""
-    config_path = Path(data_dir) / "config.json"
-    if not config_path.exists():
+    config = _load_config(data_dir)
+    if config is None:
         print(json.dumps({
             "error": "配置文件不存在，请先运行 notion_sync.py init-config"
         }, ensure_ascii=False))
         sys.exit(1)
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return config
 
 
-# ─────────────────────────── Embedding（单条查询） ───────────────────────────
-
-def embed_query(text: str, config: dict) -> np.ndarray:
-    """将单条查询文本转为向量"""
-    provider = config["embedding_provider"]
-    api_key = decode_key(config["embedding_api_key"])
-
-    if provider == "azure":
-        return _embed_azure(text, api_key, config)
-    elif provider == "openai":
-        return _embed_openai(text, api_key, config)
-    elif provider == "gemini":
-        return _embed_gemini(text, api_key, config)
-    else:
-        raise ValueError(f"不支持的 Embedding 提供商: {provider}")
-
-
-def _embed_azure(text: str, api_key: str, config: dict) -> np.ndarray:
-    endpoint = config.get("azure_endpoint", "").rstrip("/")
-    deployment = config.get("azure_deployment", "text-embedding-3-small")
-    url = f"{endpoint}/openai/deployments/{deployment}/embeddings?api-version=2024-02-01"
-    resp = requests.post(url, headers={
-        "api-key": api_key,
-        "Content-Type": "application/json",
-    }, json={"input": [text]}, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Azure API 错误 [{resp.status_code}]: {resp.text[:200]}")
-    return np.array(resp.json()["data"][0]["embedding"], dtype=np.float32)
-
-
-def _embed_openai(text: str, api_key: str, config: dict) -> np.ndarray:
-    model = config.get("embedding_model", "text-embedding-3-small")
-    resp = requests.post("https://api.openai.com/v1/embeddings", headers={
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }, json={"input": [text], "model": model}, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"OpenAI API 错误 [{resp.status_code}]: {resp.text[:200]}")
-    return np.array(resp.json()["data"][0]["embedding"], dtype=np.float32)
-
-
-def _embed_gemini(text: str, api_key: str, config: dict) -> np.ndarray:
-    model = config.get("embedding_model", "gemini-embedding-001")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={api_key}"
-    resp = requests.post(url, headers={
-        "Content-Type": "application/json",
-    }, json={"content": {"parts": [{"text": text}]}}, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Gemini API 错误 [{resp.status_code}]: {resp.text[:200]}")
-    return np.array(resp.json()["embedding"]["values"], dtype=np.float32)
+# ─────────────────────── Embedding（来自 embedding_utils.py）──────────────
+# embed_query 已从 embedding_utils 导入
 
 
 # ─────────────────────────── 余弦相似度检索 ───────────────────────────
@@ -131,18 +72,45 @@ def search_brain(query: str, top_k: int, data_dir: str,
             "results": []
         }, ensure_ascii=False, indent=2)
 
-    # 加载配置和数据
-    config = load_config(data_dir)
-    vectors = np.load(str(vectors_path))
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
+    if top_k <= 0:
+        return json.dumps({
+            "error": "top-k 必须大于 0",
+            "results": []
+        }, ensure_ascii=False, indent=2)
 
-    # 查询向量化
-    query_vec = embed_query(query, config)
+    try:
+        # 加载配置和数据
+        config = load_config(data_dir)
+        vectors = np.load(str(vectors_path), mmap_mode="r")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
 
-    # 相似度匹配
-    scores = cosine_similarity(query_vec, vectors)
-    top_indices = np.argsort(scores)[::-1][:top_k]
+        if len(meta) == 0 or vectors.shape[0] == 0:
+            return json.dumps({
+                "error": "知识库为空，请先运行 notion_sync.py sync 同步数据",
+                "results": []
+            }, ensure_ascii=False, indent=2)
+
+        # 查询向量化
+        query_vec = embed_query(query, config)
+        if query_vec.shape[0] != vectors.shape[1]:
+            return json.dumps({
+                "error": (
+                    "向量维度不一致，请在更换 Embedding 模型后执行 "
+                    "notion_sync.py sync --full"
+                ),
+                "results": []
+            }, ensure_ascii=False, indent=2)
+
+        # 相似度匹配
+        safe_k = min(top_k, len(meta))
+        scores = cosine_similarity(query_vec, vectors)
+        top_indices = np.argsort(scores)[::-1][:safe_k]
+    except Exception as e:
+        return json.dumps({
+            "error": f"检索失败: {e}",
+            "results": []
+        }, ensure_ascii=False, indent=2)
 
     elapsed_ms = int((time.time() - start_time) * 1000)
 
