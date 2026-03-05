@@ -1,0 +1,14 @@
+# Data directory containing sensitive config and large vectors
+data/
+*.npy
+*.json
+!**/*.json
+
+# Keep config structure but not the real contents, though no template config exists yet.
+# We'll just ignore the whole data directory since it's generated locally.
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.env
